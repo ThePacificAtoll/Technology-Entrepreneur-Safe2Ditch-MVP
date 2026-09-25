@@ -27,7 +27,7 @@ Each map has **four parks** (one per quadrant, at least 300 m apart) and **two s
 
 ## Trials
 
-The script generates **10 maps** and runs **100 failures per map** (1,000 total). Each trial redraws 1,500 person centers at allowed park or road/open-border positions; each center marks a 5 × 5 m danger zone. It also draws a new drone position and a remaining range uniformly between **25 and 150 m**. All three strategies face the same map, people, position, and range in that trial. A new map is generated after its 100 trials. Fixed seeds make reruns reproducible.
+The script generates **10 maps** and runs **100 failures per map** (1,000 total). Each trial redraws 1,500 person centers. Roughly 13% are sampled from backyards, with **at most two distinct centers per residential lot**. Parks have a strict cap of **7% of all people (105 centers across four parks)** and **27 per park**; excess placements go to the other public locations. The rest are at road/open and road/school borders. Each center marks a 5 × 5 m danger zone. The trial also draws a new drone position and a remaining range uniformly between **25 and 150 m**. All three strategies face the same map, people, position, and range in that trial. A new map is generated after its 100 trials. Fixed seeds make reruns reproducible.
 
 ## Reading the outputs
 
@@ -38,4 +38,12 @@ The script generates **10 maps** and runs **100 failures per map** (1,000 total)
 - **High risk** is the share landing on a cell with score at least 0.60 (road, house, school, or person).
 - **Mean risk** averages assigned scores; it is not a probability of injury.
 
-The `maps/` folder contains each static map. The `charts/` folder contains one four-panel PNG per map and one overall chart. CSV files contain the same quantitative summaries.
+The `maps/` folder contains each neighborhood with the **first trial's people** overlaid. Later trials redraw people independently; each map image is a sample, not an average. The `charts/` folder contains one four-panel PNG per map and one overall chart. CSV files contain the same quantitative summaries.
+
+The normal command, `python safe2ditch_scaled_sim.py`, generates all 10 people-inclusive map images along with the experiment. To render only a selected map without running the trials, optionally use:
+
+```bash
+python safe2ditch_scaled_sim.py --people-map --map-number 1
+```
+
+This saves `simulation_output_suburban_final/maps/Map_01_with_people.png`. Change `--map-number` to choose a design from 1 to 10; `--output path.png` sets a custom filename. The preview uses the selected map's first trial person placement.

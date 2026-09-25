@@ -15,13 +15,21 @@
 - People may be centered on:
     * open cells directly adjacent to roads,
     * road cells directly adjacent to open land,
+    * road cells adjacent to schools and school cells adjacent to roads,
     * any park cell.
+    * a small, separately sampled fraction of residential backyards,
+      with up to two people per backyard.
+- Person centers in parks are capped at 7% of all people per trial,
+  distributed across parks with a per-park ceiling.
 - Compares baseline, Safe2Ditch without verification, and Safe2Ditch with verification.
 - Saves every generated static map as an image and writes CSV summaries.
+- Optional --people-map mode saves a selected design with one trial's person
+  centers and 5 x 5 m danger zones overlaid, without running the experiment.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 from contextlib import redirect_stdout
@@ -31,6 +39,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch, Rectangle
+from matplotlib.lines import Line2D
 
 # -----------------------------------------------------------------------------
 # Simulation configuration
@@ -102,6 +111,9 @@ UNDEVELOPED_BLOCK_COUNT_OPTIONS = (2, 3, 4)
 # before overlap. Actual coverage is somewhat lower because zones can overlap.
 PEOPLE_PER_TRIAL = 1500
 PERSON_DANGER_SIZE_M = 5        # must be odd so there is one center cell
+BACKYARD_PERSON_FRACTION = 0.13  # expected share of all people
+MAX_PEOPLE_PER_BACKYARD = 2
+PARK_PERSON_FRACTION = 0.07      # sampling target AND hard share ceiling
 
 # Failure / reachability model.
 MIN_RANGE_M = 25
@@ -664,31 +676,57 @@ def build_map(
 # People / dynamic hazard generation
 # -----------------------------------------------------------------------------
 
-def find_person_center_candidates(base_map: np.ndarray):
-    """Find legal center cells for people according to the requested rules."""
+def backyard_regions_and_mask(base_map: np.ndarray, residential_plots):
+    """Identify the open area behind each house, one region per residential lot."""
+    regions = []
+    mask = np.zeros(base_map.shape, dtype=bool)
+    for plot in residential_plots:
+        r0, r1, c0, c1 = plot["bounds"]
+        hr0, hr1, hc0, hc1 = plot["house_bounds"]
+        side = plot["frontage_side"]
+        if side == "top":
+            region = (hr1, r1, c0, c1)
+        elif side == "bottom":
+            region = (r0, hr0, c0, c1)
+        elif side == "left":
+            region = (r0, r1, hc1, c1)
+        else:
+            region = (r0, r1, c0, hc0)
+        a, b, x, y = region
+        if a >= b or x >= y or not np.all(base_map[a:b, x:y] == OPEN):
+            raise AssertionError("Backyard is not a nonempty open region")
+        regions.append(region)
+        mask[a:b, x:y] = True
+    return regions, mask
+
+
+def find_person_center_candidates(
+    base_map: np.ndarray, backyard_mask: np.ndarray | None = None
+):
+    """Find park, sidewalk, and school-edge centers (excluding backyards)."""
     open_mask = base_map == OPEN
     road_mask = base_map == ROAD
     park_mask = base_map == PARK
+    school_mask = base_map == SCHOOL
 
-    # Does an OPEN cell have a ROAD cell directly north/south/east/west?
-    open_adjacent_to_road = np.zeros_like(open_mask)
-    open_adjacent_to_road[1:, :] |= road_mask[:-1, :]
-    open_adjacent_to_road[:-1, :] |= road_mask[1:, :]
-    open_adjacent_to_road[:, 1:] |= road_mask[:, :-1]
-    open_adjacent_to_road[:, :-1] |= road_mask[:, 1:]
-
-    # Does a ROAD cell have an OPEN cell directly north/south/east/west?
-    road_adjacent_to_open = np.zeros_like(road_mask)
-    road_adjacent_to_open[1:, :] |= open_mask[:-1, :]
-    road_adjacent_to_open[:-1, :] |= open_mask[1:, :]
-    road_adjacent_to_open[:, 1:] |= open_mask[:, :-1]
-    road_adjacent_to_open[:, :-1] |= open_mask[:, 1:]
+    def four_neighbors(mask):
+        adjacent = np.zeros_like(mask)
+        adjacent[1:, :] |= mask[:-1, :]
+        adjacent[:-1, :] |= mask[1:, :]
+        adjacent[:, 1:] |= mask[:, :-1]
+        adjacent[:, :-1] |= mask[:, 1:]
+        return adjacent
 
     eligible = (
         park_mask
-        | (open_mask & open_adjacent_to_road)
-        | (road_mask & road_adjacent_to_open)
+        | (open_mask & four_neighbors(road_mask))
+        | (road_mask & four_neighbors(open_mask | school_mask))
+        | (school_mask & four_neighbors(road_mask))
     )
+    if backyard_mask is not None:
+        if backyard_mask.shape != base_map.shape:
+            raise ValueError("Backyard mask must match the map")
+        eligible &= ~backyard_mask
 
     # A 5x5 m danger zone needs two cells of room around its center.
     radius = PERSON_DANGER_SIZE_M // 2
@@ -705,19 +743,86 @@ def place_people(
     candidate_centers: np.ndarray,
     rng: np.random.Generator,
     count: int = PEOPLE_PER_TRIAL,
+    backyard_regions=(),
+    park_regions=(),
 ):
-    """Place random people and return their combined 5x5 m danger-zone mask."""
-    if len(candidate_centers) < count:
+    """Sample street edges, capped parks, and sparsely occupied backyards."""
+    if not park_regions and np.any(base_map == PARK):
+        raise ValueError("Park bounds are required to enforce the per-park cap")
+    backyard_share = BACKYARD_PERSON_FRACTION if backyard_regions else 0.0
+    park_share = PARK_PERSON_FRACTION if park_regions else 0.0
+    backyard_count, park_target, _ = rng.multinomial(
+        count, [backyard_share, park_share, 1 - backyard_share - park_share]
+    )
+    backyard_count = int(backyard_count)
+    park_target = min(int(park_target), int(count * PARK_PERSON_FRACTION))
+    if backyard_count > MAX_PEOPLE_PER_BACKYARD * len(backyard_regions):
+        raise RuntimeError("Not enough backyard capacity for selected people")
+
+    park_cells = base_map[candidate_centers[:, 0], candidate_centers[:, 1]] == PARK
+    public_candidates = candidate_centers[~park_cells]
+    park_candidates = []
+    for r0, r1, c0, c1 in park_regions:
+        subset = candidate_centers[
+            park_cells
+            & (candidate_centers[:, 0] >= r0)
+            & (candidate_centers[:, 0] < r1)
+            & (candidate_centers[:, 1] >= c0)
+            & (candidate_centers[:, 1] < c1)
+        ]
+        park_candidates.append(subset)
+    per_park_cap = (
+        math.ceil(count * PARK_PERSON_FRACTION / len(park_regions))
+        if park_regions else 0
+    )
+    park_caps = np.array(
+        [min(per_park_cap, len(x)) for x in park_candidates], dtype=int
+    )
+    park_counts = np.zeros(len(park_regions), dtype=int)
+    for _ in range(min(park_target, int(park_caps.sum()))):
+        available = np.flatnonzero(park_counts < park_caps)
+        park_counts[int(rng.choice(available))] += 1
+
+    public_count = count - backyard_count - int(park_counts.sum())
+    if len(public_candidates) < public_count:
         raise RuntimeError(
-            f"Only {len(candidate_centers)} legal person centers exist, "
-            f"but {count} were requested."
+            f"Only {len(public_candidates)} non-park public centers exist, "
+            f"but {public_count} public centers were requested."
         )
 
-    selected = rng.choice(len(candidate_centers), size=count, replace=False)
-    centers = candidate_centers[selected]
+    selected = rng.choice(len(public_candidates), size=public_count, replace=False)
+    center_groups = [public_candidates[selected]]
+    for subset, park_count in zip(park_candidates, park_counts):
+        selected = rng.choice(len(subset), size=int(park_count), replace=False)
+        center_groups.append(subset[selected])
+    radius = PERSON_DANGER_SIZE_M // 2
+    backyard_centers = []
+    # Each lot contributes two selectable slots. Sampling slots without
+    # replacement allows zero, one, or two people in each backyard.
+    slots = rng.choice(
+        MAX_PEOPLE_PER_BACKYARD * len(backyard_regions),
+        size=backyard_count, replace=False,
+    )
+    lot_indices, occupancy = np.unique(
+        slots // MAX_PEOPLE_PER_BACKYARD, return_counts=True
+    )
+    for index, residents in zip(lot_indices, occupancy):
+        r0, r1, c0, c1 = backyard_regions[index]
+        # Keep the 5x5 m danger zone entirely inside the map; the center is
+        # inside its selected backyard. Two residents get distinct centers.
+        row_start, row_end = max(r0, radius), min(r1, N - radius)
+        col_start, col_end = max(c0, radius), min(c1, N - radius)
+        width = col_end - col_start
+        choices = rng.choice((row_end - row_start) * width,
+                             size=int(residents), replace=False)
+        for offset in choices:
+            backyard_centers.append((row_start + int(offset // width),
+                                     col_start + int(offset % width)))
+    if backyard_centers:
+        center_groups.append(np.asarray(backyard_centers, dtype=int))
+    centers = np.vstack(center_groups)
 
     hazard_mask = np.zeros(base_map.shape, dtype=bool)
-    radius = PERSON_DANGER_SIZE_M // 2
 
     for r, c in centers:
         hazard_mask[
@@ -725,7 +830,7 @@ def place_people(
             c - radius:c + radius + 1,
         ] = True
 
-    return hazard_mask, centers
+    return hazard_mask, centers, backyard_count, park_counts
 
 
 # -----------------------------------------------------------------------------
@@ -815,8 +920,12 @@ def save_map_image(
     output_path: Path,
     show: bool = SHOW_MAP_IMAGES,
     residential_plots=None,
+    person_mask: np.ndarray | None = None,
+    person_centers: np.ndarray | None = None,
 ):
-    """Save one static map design as a PNG image."""
+    """Save a static map, optionally overlaying one trial's people and hazards."""
+    if (person_mask is None) != (person_centers is None):
+        raise ValueError("person_mask and person_centers must be supplied together")
     colors = [
         "#cfe8b4",  # open
         "#4f9d4a",  # park
@@ -837,7 +946,23 @@ def save_map_image(
         origin="upper",
     )
 
-    ax.set_title(f"{map_name} - Static Neighborhood Design")
+    if person_mask is not None:
+        if person_mask.shape != base_map.shape:
+            raise ValueError("Person hazard mask must match the map")
+        overlay = np.ma.masked_where(~person_mask, person_mask)
+        ax.imshow(
+            overlay, cmap=ListedColormap(["#dd202c"]), vmin=0, vmax=1,
+            alpha=0.60, interpolation="nearest", origin="upper",
+        )
+        ax.scatter(
+            person_centers[:, 1], person_centers[:, 0],
+            s=3, c="#270c16", alpha=0.85, linewidths=0, zorder=4,
+        )
+        ax.set_title(
+            f"{map_name} - {len(person_centers):,} Person Centers and 5 x 5 m Danger Zones"
+        )
+    else:
+        ax.set_title(f"{map_name} - Static Neighborhood Design")
     ax.set_xlabel("Meters east-west")
     ax.set_ylabel("Meters north-south")
 
@@ -856,6 +981,12 @@ def save_map_image(
         Patch(facecolor=colors[HOUSE], label="House"),
         Patch(facecolor=colors[SCHOOL], label="School"),
     ]
+    if person_mask is not None:
+        legend.extend([
+            Patch(facecolor="#dd202c", alpha=0.60, label="Person danger zone (5 x 5 m)"),
+            Line2D([0], [0], marker=".", linestyle="None", color="#270c16",
+                   markersize=7, label="Person center"),
+        ])
     ax.legend(handles=legend, loc="upper left", bbox_to_anchor=(1.01, 1.0))
 
     # Draw thin lot boundaries so the two back-to-back rows are visible.
@@ -1016,6 +1147,8 @@ def _run_experiment(
     num_maps: int = NUM_MAPS,
     trials_per_map: int = TRIALS_PER_MAP,
 ):
+    if num_maps < 1 or trials_per_map < 1:
+        raise ValueError("At least one map and one trial per map are required")
     OUTPUT_DIR.mkdir(exist_ok=True)
     MAP_DIR.mkdir(exist_ok=True)
     CHART_DIR.mkdir(exist_ok=True)
@@ -1027,6 +1160,17 @@ def _run_experiment(
     print("strategies within a trial. Each strategy makes one landing per trial.")
     print("Drop in place = current cell; Map only = best reachable mapped site;")
     print("Map + verification = inspect up to five distinct candidate sites.")
+    print(f"Each trial places {PEOPLE_PER_TRIAL} people; roughly "
+          f"{BACKYARD_PERSON_FRACTION:.0%} are sampled from backyards")
+    print(f"(at most {MAX_PEOPLE_PER_BACKYARD} per yard). Parks are capped "
+          f"at {PARK_PERSON_FRACTION:.0%} "
+          f"of all people, or {int(PEOPLE_PER_TRIAL * PARK_PERSON_FRACTION)} total")
+    print(f"across {NUM_PARKS} parks (at most "
+          f"{math.ceil(PEOPLE_PER_TRIAL * PARK_PERSON_FRACTION / NUM_PARKS)} "
+          "in any single park).")
+    print("The others use road/open and road/school borders.")
+    print("Each saved map image displays its FIRST trial's people; the people")
+    print("are redrawn in the remaining trials used for the statistics.")
     print("Percentages describe shares of cells or simulated landings, not")
     print("probabilities of injury. OPEN includes yards and undeveloped land.")
 
@@ -1061,22 +1205,20 @@ def _run_experiment(
         base_map, residential_plots, special_areas, swaths = build_map(
             map_rng, return_metadata=True
         )
-        person_candidates = find_person_center_candidates(base_map)
+        park_regions = [a["bounds"] for a in special_areas if a["cell_type"] == PARK]
+        backyard_regions, backyard_mask = backyard_regions_and_mask(
+            base_map, residential_plots
+        )
+        person_candidates = find_person_center_candidates(base_map, backyard_mask)
 
         image_path = MAP_DIR / f"{map_name}.png"
-        save_map_image(
-            base_map,
-            map_name,
-            image_path,
-            residential_plots=residential_plots,
-        )
 
         print("\n" + "=" * 72)
         one_side_plots = sum(len(p["road_sides"]) == 1 for p in residential_plots)
         two_side_plots = sum(len(p["road_sides"]) == 2 for p in residential_plots)
 
         print(f"Generated {map_name}")
-        print(f"Image saved to: {image_path}")
+        print(f"Map image with trial 1 people: {image_path}")
         print(
             f"Parcels: {NUM_PARKS} parks, {NUM_SCHOOLS} schools, "
             f"{len(swaths)} undeveloped swaths spanning "
@@ -1143,14 +1285,28 @@ def _run_experiment(
         # Effective composition includes person danger zones. Because people move
         # every trial, accumulate composition and average it after all 100 trials.
         effective_counts_sum = np.zeros(len(CELL_TYPES), dtype=np.int64)
+        backyard_count_sum = 0
+        park_count_sum = 0
+        maximum_park_count = 0
 
         for trial in range(trials_per_map):
-            person_mask, _ = place_people(
+            person_mask, person_centers, backyard_count, park_counts = place_people(
                 base_map,
                 person_candidates,
                 trial_rng,
                 count=PEOPLE_PER_TRIAL,
+                backyard_regions=backyard_regions,
+                park_regions=park_regions,
             )
+            backyard_count_sum += backyard_count
+            park_count_sum += int(park_counts.sum())
+            maximum_park_count = max(maximum_park_count, int(park_counts.max()))
+            if trial == 0:
+                save_map_image(
+                    base_map, map_name, image_path,
+                    residential_plots=residential_plots,
+                    person_mask=person_mask, person_centers=person_centers,
+                )
 
             # Compute dynamic/effective map composition efficiently.
             # Person danger zones override the underlying terrain for landing risk.
@@ -1223,6 +1379,16 @@ def _run_experiment(
         )
         print_landing_table(
             map_landing_counts, map_high_counts, map_risk_sums, trials_per_map
+        )
+        print(
+            f"Backyard people per trial: {backyard_count_sum / trials_per_map:.1f} "
+            f"of {PEOPLE_PER_TRIAL} on average, across {len(backyard_regions)} lots."
+        )
+        print(
+            f"Park people per trial: {park_count_sum / trials_per_map:.1f} "
+            f"across {len(park_regions)} parks on average; maximum observed "
+            f"in any one park: {maximum_park_count} "
+            f"(cap {math.ceil(PEOPLE_PER_TRIAL * PARK_PERSON_FRACTION / len(park_regions))})."
         )
         chart_path = CHART_DIR / f"{map_name}_statistics.png"
         save_statistics_chart(
@@ -1402,5 +1568,54 @@ def run_experiment(
             return _run_experiment(num_maps, trials_per_map)
 
 
+def generate_people_map(map_number: int = 1, output_path: Path | None = None):
+    """Render a selected seeded map with the people from its first trial.
+
+    Separate map/trial seed streams make this preview reproducible without
+    changing the default Monte Carlo results or writing the experiment log.
+    """
+    if not 1 <= map_number <= NUM_MAPS:
+        raise ValueError(f"Map number must be between 1 and {NUM_MAPS}")
+    map_seed = np.random.SeedSequence(MAP_MASTER_SEED).spawn(NUM_MAPS)[map_number - 1]
+    trial_seed = np.random.SeedSequence(TRIAL_MASTER_SEED).spawn(NUM_MAPS)[map_number - 1]
+    base_map, plots, special_areas, _ = build_map(
+        np.random.default_rng(map_seed), return_metadata=True
+    )
+    park_regions = [a["bounds"] for a in special_areas if a["cell_type"] == PARK]
+    backyard_regions, backyard_mask = backyard_regions_and_mask(base_map, plots)
+    centers_allowed = find_person_center_candidates(base_map, backyard_mask)
+    mask, centers, _, _ = place_people(
+        base_map, centers_allowed, np.random.default_rng(trial_seed),
+        backyard_regions=backyard_regions, park_regions=park_regions,
+    )
+    path = (Path(output_path) if output_path is not None
+            else MAP_DIR / f"Map_{map_number:02d}_with_people.png")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_map_image(
+        base_map, f"Map_{map_number:02d}", path,
+        residential_plots=plots, person_mask=mask, person_centers=centers,
+    )
+    return path
+
+
 if __name__ == "__main__":
-    run_experiment()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--people-map", action="store_true",
+        help="Save one map showing person centers and their 5 x 5 m danger zones."
+    )
+    parser.add_argument(
+        "--map-number", type=int, default=1, choices=range(1, NUM_MAPS + 1),
+        metavar=f"1-{NUM_MAPS}", help="Which seeded map to preview (default: 1)."
+    )
+    parser.add_argument(
+        "--output", type=Path, help="PNG output path for --people-map."
+    )
+    args = parser.parse_args()
+    if args.people_map:
+        path = generate_people_map(args.map_number, args.output)
+        print(f"Saved map with people to {path}")
+    else:
+        if args.output is not None or args.map_number != 1:
+            parser.error("--output and --map-number require --people-map")
+        run_experiment()
